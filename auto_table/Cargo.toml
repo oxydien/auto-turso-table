@@ -1,0 +1,8 @@
+[package]
+name = "auto_table"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+auto_table_derive = { path = "../auto_table_derive" }
+turso = "0.5.3"
