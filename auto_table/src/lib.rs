@@ -1,8 +1,16 @@
-use std::collections::HashSet;
-use std::io::{Error, ErrorKind};
-use turso::{params, Connection, Rows, value::Value};
-use turso::params::IntoValue;
+pub mod queries;
+pub mod sql_helpers;
+pub mod extensions;
+mod conn;
+
+use std::borrow::Cow;
 pub use auto_table_derive::AutoTable;
+
+use crate::sql_helpers::{generate_create_table, get_columns, no_params};
+use std::collections::HashSet;
+use log::debug;
+use serde::Serialize;
+use async_trait::async_trait;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -11,6 +19,7 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub enum SqlError {
     ColumnCountMismatch,
     InvalidData(String),
+    SerializationIssue(String),
 }
 
 // Mark: Column Definition
@@ -49,14 +58,159 @@ pub trait AutoTable {
     fn table_name() -> &'static str;
     fn indexes() -> Option<String>;
     fn column_definitions() -> Vec<ColumnDefinition>;
-    fn to_sql_values(&self) -> Vec<String>;
-    fn from_sql_values(values: &[Value]) -> Result<Self, SqlError> where Self: Sized;
+    fn to_sql_values(&self) -> Result<Vec<AtValue>, SqlError>;
+    fn from_sql_values(values: &[AtValue]) -> Result<Self, SqlError> where Self: Sized;
 
     fn get_id_column() -> Option<ColumnDefinition> {
         Self::column_definitions().iter().find(|d| d.primary_key).map(|d| d.clone())
     }
     fn get_sort_columns() -> Vec<ColumnDefinition> {
         Self::column_definitions().iter().filter(|d| d.sort_by.is_some()).map(|d| d.clone()).collect()
+    }
+}
+
+/// Codec for custom sql value serialization
+pub trait AtSqlCodec {
+    fn to_sql(&self) -> impl AtIntoValue;
+    fn from_sql(value: &AtValue) -> Result<Self, SqlError> where Self: Sized;
+}
+
+/// Abstraction layer for connection
+#[async_trait]
+pub trait AtConnection: Sized + Send + Sync {
+    type Rows: AtRows;
+    type Statement: AtStatement;
+
+    async fn query(&self, sql: impl AsRef<str> + Send + Sync, params: impl AtIntoParams + Send) -> Result<Self::Rows, BoxError>;
+    async fn execute(&self, sql: impl AsRef<str> + Send + Sync, params: impl AtIntoParams + Send) -> Result<u64, BoxError>;
+    async fn prepare(&self, sql: impl AsRef<str> + Send + Sync) -> Result<Self::Statement, BoxError>;
+}
+
+/// Abstraction layer for sql prepared statements
+#[async_trait]
+pub trait AtStatement: Sized + Send + Sync {
+    type Rows: AtRows;
+
+    async fn query(&mut self, params: impl AtIntoParams + Send) -> Result<Self::Rows, BoxError>;
+}
+
+/// Abstraction layer for turning array into params
+pub trait AtIntoParams: Sized + Send {
+    fn into_params(self) -> Result<AtParams, BoxError>;
+}
+
+/// Abstraction layer for turning value into sql
+pub trait AtIntoValue: Sized + Clone + Send {
+    fn into_value(self) -> Result<AtValue, BoxError>;
+}
+
+/// Abstraction layer for sql results
+#[async_trait]
+pub trait AtRows: Sized + Send + Sync {
+    type Row: AtRow;
+
+    fn column_count(&self) -> usize;
+    async fn next(&mut self) -> Result<Option<Self::Row>, BoxError>;
+}
+
+/// Abstraction layer for sql result
+pub trait AtRow: Sized + Send + Sync {
+    fn get_value(&self, idx: usize) -> Result<AtValue, BoxError>;
+    fn get<T>(&self, idx: usize) -> Result<T, BoxError>
+    where
+      T: AtFromValue;
+    fn column_count(&self) -> usize;
+}
+
+/// Abstraction layer for turning sql into value
+pub trait AtFromValue: Sized + Send {
+    fn from_sql(val: AtValue) -> Result<Self, BoxError>
+    where
+      Self: Sized;
+}
+
+/// Abstraction layer for sql parameters
+#[derive(Debug, Clone)]
+pub enum AtParams {
+    None,
+    Positional(Vec<AtValue>),
+    Named(Vec<(Cow<'static, str>, AtValue)>),
+}
+
+/// Abstraction layer for value
+#[derive(Clone, Debug, PartialEq)]
+pub enum AtValue {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+/// Trait used to differentiate between traits that are not implemented
+pub trait AtCodecMarker {}
+
+#[derive(Serialize)]
+pub struct Paginated<T>
+where T : Serialize {
+    pub count: u32,
+    pub pages: u32,
+    pub page: u32,
+    pub page_size: u32,
+    pub content: Vec<T>
+}
+
+impl AtValue {
+    pub fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+
+    pub fn is_integer(&self) -> bool {
+        matches!(self, Self::Integer(..))
+    }
+
+    pub fn is_real(&self) -> bool {
+        matches!(self, Self::Real(..))
+    }
+
+    pub fn as_real(&self) -> Option<&f64> {
+        if let Self::Real(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_text(&self) -> bool {
+        matches!(self, Self::Text(..))
+    }
+
+    pub fn as_text(&self) -> Option<&String> {
+        if let Self::Text(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_integer(&self) -> Option<&i64> {
+        if let Self::Integer(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_blob(&self) -> bool {
+        matches!(self, Self::Blob(..))
+    }
+
+    pub fn as_blob(&self) -> Option<&Vec<u8>> {
+        if let Self::Blob(v) = self {
+            Some(v)
+        } else {
+            None
+        }
     }
 }
 
@@ -70,7 +224,7 @@ pub trait AutoTable {
 /// | Table missing  | `CREATE TABLE`                              |
 /// | Column added   | `ALTER TABLE … ADD COLUMN`                  |
 /// | Column removed | `ALTER TABLE … DROP COLUMN`                 |
-pub async fn sync_table<T: AutoTable>(conn: &Connection) -> Result<(), BoxError> {
+pub async fn sync_table<T: AutoTable>(conn: &impl AtConnection) -> Result<(), BoxError> {
     let table_name = T::table_name();
     let col_defs   = T::column_definitions();
 
@@ -78,13 +232,9 @@ pub async fn sync_table<T: AutoTable>(conn: &Connection) -> Result<(), BoxError>
 
     if existing.is_empty() {
         // CREATE TABLE
-        let cols_sql = col_defs.iter()
-            .map(|c| c.to_sql())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!("CREATE TABLE {} ({})", table_name, cols_sql);
-        conn.execute(sql, params!()).await?;
-        println!("[auto_table] Created table `{}`", table_name);
+        let sql = generate_create_table(table_name, &col_defs);
+        conn.execute(sql, no_params()).await?;
+        debug!("Created table `{}`", table_name);
     } else {
         let defined: HashSet<&str> =
             col_defs.iter().map(|c| c.name).collect();
@@ -92,155 +242,23 @@ pub async fn sync_table<T: AutoTable>(conn: &Connection) -> Result<(), BoxError>
         // ADD new columns
         for col in col_defs.iter().filter(|c| !existing.contains(c.name)) {
             let sql = format!("ALTER TABLE {} ADD COLUMN {}", table_name, col.to_sql());
-            conn.execute(sql, params!()).await?;
-            println!("[auto_table] Added   `{}.{}`", table_name, col.name);
+            conn.execute(sql, no_params()).await?;
+            debug!("Added   `{}.{}`", table_name, col.name);
         }
 
         // DROP removed columns
         for old in existing.iter().filter(|c| !defined.contains(c.as_str())) {
             let sql = format!("ALTER TABLE {} DROP COLUMN {}", table_name, old.to_string());
-            conn.execute(sql, params!()).await?;
-            println!("[auto_table] Dropped `{}.{}`", table_name, old);
+            conn.execute(sql, no_params()).await?;
+            debug!("Dropped `{}.{}`", table_name, old);
         }
     }
 
     if let Some(indexes) = T::indexes() {
         let sql = format!("CREATE INDEX IF NOT EXISTS idx_auto_table ON {} ({})", table_name, indexes);
-        conn.execute(sql, params!()).await?;
+        conn.execute(sql, no_params()).await?;
     }
 
-    println!("[auto_table] Finished sync on `{}`", table_name);
+    debug!("Finished sync on `{}`", table_name);
     Ok(())
-}
-
-pub async fn get_by_id<T: AutoTable>(conn: &Connection, id: impl IntoValue) -> Result<Option<T>, BoxError> {
-    let id_column = T::get_id_column();
-    if let None = id_column {
-        return Err(Box::new(Error::new(ErrorKind::NotSeekable, "No Id column available")));
-    }
-
-    let select_clause = generate_select_clause(&T::column_definitions());
-    let query = format!("{} FROM {} WHERE {} = ? LIMIT 1", select_clause, T::table_name(), id_column.unwrap().name);
-
-    let res = conn.query(query, params!(id)).await?;
-    let formatted = format_rows::<T>(res).await?;
-
-    Ok(formatted.into_iter().nth(0))
-}
-
-pub async fn get_one_by_column<T: AutoTable>(conn: &Connection, column: impl ToString, value: impl IntoValue) -> Result<Option<T>, BoxError> {
-    let select_clause = generate_select_clause(&T::column_definitions());
-    let query = format!("{} FROM {} WHERE {} = ? LIMIT 1", select_clause, T::table_name(), column.to_string());
-
-    let res = conn.query(query, params!(value)).await?;
-    let formatted = format_rows::<T>(res).await?;
-
-    Ok(formatted.into_iter().nth(0))
-}
-
-pub async fn get_in_range<T: AutoTable>(conn: &Connection, limit: i64, offset: u64) -> Result<Vec<T>, BoxError> {
-    let select_clause = generate_select_clause(&T::column_definitions());
-    let order_clause = generate_order_clause(&T::get_sort_columns());
-    let query = format!("{} FROM {} {} LIMIT ? OFFSET ?", select_clause, T::table_name(), order_clause);
-
-    let res = conn.query(query, params!(limit, offset)).await?;
-    let formatted = format_rows::<T>(res).await?;
-
-    Ok(formatted)
-}
-
-/// Inserts the given entry into the database. Replaces given entry if already same `primary_key` exists
-pub async fn insert_into<T: AutoTable>(conn: &Connection, entry: &T) -> Result<(), BoxError> {
-    let sql = generate_insert_into(T::table_name(), &T::column_definitions());
-
-    conn.execute(sql, entry.to_sql_values()).await?;
-
-    Ok(())
-}
-
-pub async fn format_rows<T: AutoTable>(mut rows: Rows) -> Result<Vec<T>, BoxError> {
-    let mut output: Vec<T> = Vec::new();
-    let mut entries: Vec<Vec<Value>> = Vec::new();
-    while let Some(row) = rows.next().await? {
-        let mut col_values: Vec<Value> = Vec::new();
-        for col_index in 0..row.column_count() {
-            col_values.push(row.get_value(col_index)?);
-        }
-        entries.push(col_values);
-    }
-    for col_values in entries {
-        output.push(T::from_sql_values(col_values.as_slice()).map_err(|e|
-            Box::new(Error::new(ErrorKind::NotSeekable, format!("Failed to read entry: {:?}", e))))?)
-    }
-
-    Ok(output)
-}
-
-// Mark: Local utility functions
-
-async fn get_columns(conn: &Connection, table_name: &str) -> Result<Vec<String>, BoxError> {
-    let validated_table_name = validate_table_name(table_name)?;
-    let query = format!("PRAGMA table_info({})", validated_table_name);
-    let mut smtp = conn.prepare(query).await.expect("Failed to prepare query");
-    let mut rows = smtp.query(params!()).await.expect("Failed to query PRAGMA table_info");
-    let mut columns = vec![];
-    while let Some(row) = rows.next().await? {
-        let name: String = row.get(1)?;
-        columns.push(name);
-    }
-    Ok(columns)
-}
-
-fn generate_select_clause(columns: &Vec<ColumnDefinition>) -> String {
-    let mut query = String::from("SELECT ");
-    for col in columns {
-        query.push_str(&col.name);
-        query.push(',');
-    }
-    query.pop();
-    query
-}
-
-fn generate_order_clause(sortable_columns: &Vec<ColumnDefinition>) -> String {
-    if sortable_columns.len() == 0 { return String::new(); }
-
-    let mut builder = String::from("ORDER BY ");
-    for col in sortable_columns {
-        builder.push_str(&col.name);
-        if let Some(sort_direction) = &col.sort_by {
-            builder.push(' ');
-            builder.push_str(sort_direction);
-        }
-        builder.push(',');
-    }
-    builder.pop();
-    builder
-}
-
-fn generate_insert_into(table_name: &str, columns: &Vec<ColumnDefinition>) -> String {
-    let mut query = format!("INSERT OR REPLACE INTO {} (", table_name);
-
-    for col in columns {
-        query.push_str(&col.name);
-        query.push(',');
-    }
-    query.pop();
-
-    query.push_str(") VALUES (");
-    for _ in 0..columns.len() {
-        query.push('?');
-        query.push(',');
-    }
-    query.pop();
-    query.push(')');
-
-    query
-}
-
-fn validate_table_name(name: &str) -> Result<&str, String> {
-    if name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        Ok(name)
-    } else {
-        Err("Invalid table name".to_string())
-    }
 }
